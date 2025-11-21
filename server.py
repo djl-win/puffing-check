@@ -61,47 +61,40 @@ def _month_year(date_str: str):
 
 
 # ============ 打开产品页面 ============
-async def open_product(page) -> bool:
+async def open_product(page):
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
 
-    # 尝试关掉 cookie 弹窗
+    # 尝试关掉 cookie / 提示弹窗
     for label in ["Accept", "Agree", "OK", "I understand", "我知道了"]:
         try:
             await page.get_by_text(label, exact=False).click(timeout=1500)
             break
-        except:
+        except Exception:
             pass
 
-    try:
-        # 🔥 最重要：真正的 Puffing Billy 产品标题选择器
-        card = page.locator(
-            f"h2:has-text('{PRODUCT_NAME}'), "
-            f"article:has-text('{PRODUCT_NAME}'), "
-            f"div.card:has-text('{PRODUCT_NAME}')"
-        ).first
+    # 找到包含产品名的卡片
+    card = page.locator(
+        f"article:has-text('{PRODUCT_NAME}'), "
+        f"div.card:has-text('{PRODUCT_NAME}')"
+    ).first
+    await card.wait_for(state="visible", timeout=15000)
 
-        await card.wait_for(state="visible", timeout=25000)
-    except PWTimeout:
-        print(f"[错误] 25 秒内没有找到产品标题：{PRODUCT_NAME}")
-        return False
-    except Exception as e:
-        print(f"[错误] 选择产品标题异常: {e}")
-        return False
+    buy = card.locator(
+        "a:has-text('BUY NOW'), a:has-text('Buy Now'), a:has-text('Book Now')"
+    )
+    if await buy.count() == 0:
+        buy = card.locator("a").first
 
-    # 找按钮（buy / book）更稳一点
-    try:
-        buy = page.locator("a:has-text('Buy'), a:has-text('Book'), a").first
-        await buy.click(timeout=15000)
-    except Exception as e:
-        print(f"[错误] 点击按钮失败: {e}")
-        return False
+    onclick_js = await buy.first.get_attribute("onclick")
+    if onclick_js and "changeCategory" in onclick_js:
+        await page.evaluate(onclick_js)  # 直接执行 changeCategory(...)
+    else:
+        await buy.first.click(timeout=12000)
 
     try:
         await page.wait_for_load_state("networkidle", timeout=8000)
-    except:
+    except Exception:
         await page.wait_for_timeout(1000)
-
-    return True
 
 
 # ============ 用日历点选日期 ============
@@ -487,4 +480,3 @@ async def run_json(date: str = Query(..., description="查询日期，格式 dd/
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
-
