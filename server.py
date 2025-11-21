@@ -61,49 +61,88 @@ def _month_year(date_str: str):
 
 
 # ============ 打开产品页面 ============
-async def open_product(page):
+async def open_product(page) -> bool:
+    """
+    打开分类页面，点击指定产品（PRODUCT_NAME）的 Buy Now。
+    找不到产品 / 结构变了时返回 False，而不是抛异常。
+    """
+    print("[提示] 打开分类页面:", CATEGORY_URL)
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
+
+    # 有些环境加载慢一点，稍微等一下
+    await page.wait_for_timeout(2000)
 
     # 尝试关掉 cookie / 提示弹窗
     for label in ["Accept", "Agree", "OK", "I understand", "我知道了"]:
         try:
-            await page.get_by_text(label, exact=False).click(timeout=1500)
-            break
+            btn = page.get_by_text(label, exact=False)
+            if await btn.count() > 0:
+                await btn.first.click(timeout=1500)
+                print(f"[提示] 点击弹窗按钮: {label}")
+                break
         except Exception:
             pass
 
-    # ---------------------------
-    # 🔥 根据产品标题 <h2> 精准找到对应卡片
-    #   HTML 结构参考：
-    #   <div class="card">
-    #     <div class="card-body ...">
-    #       <h2>Belgrave to Lakeside Return</h2>
-    #       ...
-    #       <a onclick="changeCategory('BELLAKERTN')">Buy Now</a>
-    #     </div>
-    #   </div>
-    # ---------------------------
-    card = page.locator(
-        f"div.card:has(h2:has-text('{PRODUCT_NAME}'))"
-    ).first
-
-    await card.wait_for(state="visible", timeout=15000)
-
-    # 在这个 card 内部找到 Buy Now 按钮
-    buy = card.locator("a:has-text('Buy Now')").first
-
-    # 处理 onclick="changeCategory('BELLAKERTN')" 的情况
-    onclick_js = await buy.get_attribute("onclick")
-    if onclick_js and "changeCategory" in onclick_js:
-        # 直接执行 changeCategory('BELLAKERTN')
-        await page.evaluate(onclick_js)
-    else:
-        await buy.click(timeout=12000)
-
+    # 先尝试通过 heading（h1/h2/h3）定位
+    card = None
     try:
-        await page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        await page.wait_for_timeout(1000)
+        print(f"[提示] 尝试通过 heading 寻找产品: {PRODUCT_NAME}")
+        title = page.get_by_role("heading", name=PRODUCT_NAME)
+        await title.first.wait_for(state="visible", timeout=15000)
+        # 找到标题后，向上找包含它的 card 容器
+        card = title.first.locator(
+            "xpath=ancestor::div[contains(@class, 'card')]"
+        ).first
+    except PWTimeout:
+        print("[警告] get_by_role 找不到 heading，尝试备用选择器...")
+    except Exception as e:
+        print(f"[警告] 通过 heading 定位产品失败: {e}")
+
+    # 备用：用 CSS :has(...) 选择器定位
+    if card is None:
+        try:
+            print("[提示] 使用 div.card:has(h2:has-text(...)) 尝试定位产品卡片")
+            card = page.locator(
+                f"div.card:has(h2:has-text('{PRODUCT_NAME}'))"
+            ).first
+            await card.wait_for(state="visible", timeout=10000)
+        except PWTimeout:
+            print("[错误] 备用 CSS 选择器也找不到产品卡片。")
+            return False
+        except Exception as e:
+            print(f"[错误] 使用备用 CSS 选择器失败: {e}")
+            return False
+
+    # 现在 card 应该已经是对应产品卡片
+    try:
+        print("[提示] 已找到产品卡片，尝试在卡片内寻找 Buy Now 按钮...")
+        buy = card.locator("a:has-text('Buy Now')")
+        if await buy.count() == 0:
+            # 备用：如果文字不是完全一致，退而求其次拿第一个链接
+            print("[警告] 没有找到文字包含 'Buy Now' 的按钮，使用 card 内第一个 <a>。")
+            buy = card.locator("a").first
+        else:
+            buy = buy.first
+
+        onclick_js = await buy.get_attribute("onclick")
+        if onclick_js and "changeCategory" in onclick_js:
+            print("[提示] 通过 onclick(changeCategory) 进入具体日期页面。")
+            await page.evaluate(onclick_js)
+        else:
+            print("[提示] 直接点击 Buy Now 按钮。")
+            await buy.click(timeout=12000)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except PWTimeout:
+            await page.wait_for_timeout(1500)
+
+        print("[提示] 已进入具体产品的日期选择页面。")
+        return True
+
+    except Exception as e:
+        print(f"[错误] 点击 Buy Now 按钮失败: {e}")
+        return False
 
 
 # ============ 用日历点选日期 ============
@@ -317,11 +356,24 @@ async def query_date(date_str: str) -> Dict[str, Any]:
     给指定日期跑一遍官网，返回结构化结果
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         page = await browser.new_page()
 
         try:
-            await open_product(page)
+            # 1. 打开产品 & 进入日期选择页
+            ok = await open_product(page)
+            if not ok:
+                return {
+                    "date": date_str,
+                    "rows": [],
+                    "available_count": 0,
+                    "message": "官网未找到指定产品卡片，可能页面结构已更新或被风控。"
+                }
+
+            # 2. 选择日期
             picked = await pick_date_via_calendar(page, date_str)
             if not picked:
                 return {
@@ -331,6 +383,7 @@ async def query_date(date_str: str) -> Dict[str, Any]:
                     "message": "官网无此日期可选或为灰色，不可预订"
                 }
 
+            # 3. 等待并解析表格
             await wait_for_table_refresh(page)
             table_root = page.locator("#AvailabilityTable").first
             await table_root.wait_for(state="visible", timeout=15000)
