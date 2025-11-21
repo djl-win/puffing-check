@@ -9,8 +9,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ================= 配置 =================
 CATEGORY_URL = (
-    "https://bookings.puffingbillyrailway.org.au/"
-    "BookingCat/Availability/?&ParentCategory=WEBEXCURSION"
+    "https://bookings.puffingbillyrailway.org.au/BookingCat/Availability/?&ParentCategory=WEBEXCURSION"
 )
 PRODUCT_NAME = "Belgrave to Lakeside Return"
 HEADLESS = True  # 本地调试想看浏览器可以改成 False
@@ -539,3 +538,4 @@ async def run_json(date: str = Query(..., description="查询日期，格式 dd/
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+
