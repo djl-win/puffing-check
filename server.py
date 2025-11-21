@@ -72,24 +72,33 @@ async def open_product(page):
         except Exception:
             pass
 
-    # 找到包含产品名的卡片
+    # ---------------------------
+    # 🔥 根据产品标题 <h2> 精准找到对应卡片
+    #   HTML 结构参考：
+    #   <div class="card">
+    #     <div class="card-body ...">
+    #       <h2>Belgrave to Lakeside Return</h2>
+    #       ...
+    #       <a onclick="changeCategory('BELLAKERTN')">Buy Now</a>
+    #     </div>
+    #   </div>
+    # ---------------------------
     card = page.locator(
-        f"article:has-text('{PRODUCT_NAME}'), "
-        f"div.card:has-text('{PRODUCT_NAME}')"
+        f"div.card:has(h2:has-text('{PRODUCT_NAME}'))"
     ).first
+
     await card.wait_for(state="visible", timeout=15000)
 
-    buy = card.locator(
-        "a:has-text('BUY NOW'), a:has-text('Buy Now'), a:has-text('Book Now')"
-    )
-    if await buy.count() == 0:
-        buy = card.locator("a").first
+    # 在这个 card 内部找到 Buy Now 按钮
+    buy = card.locator("a:has-text('Buy Now')").first
 
-    onclick_js = await buy.first.get_attribute("onclick")
+    # 处理 onclick="changeCategory('BELLAKERTN')" 的情况
+    onclick_js = await buy.get_attribute("onclick")
     if onclick_js and "changeCategory" in onclick_js:
-        await page.evaluate(onclick_js)  # 直接执行 changeCategory(...)
+        # 直接执行 changeCategory('BELLAKERTN')
+        await page.evaluate(onclick_js)
     else:
-        await buy.first.click(timeout=12000)
+        await buy.click(timeout=12000)
 
     try:
         await page.wait_for_load_state("networkidle", timeout=8000)
@@ -353,7 +362,6 @@ async def query_date(date_str: str) -> Dict[str, Any]:
 
 
 # ============ HTML 渲染 ============
-
 def build_html(result: Dict[str, Any]) -> str:
     date_str = result["date"]
     rows = result["rows"]
@@ -442,7 +450,6 @@ def build_html(result: Dict[str, Any]) -> str:
 
 
 # ============ FastAPI 应用 ============
-
 app = FastAPI(title="Puffing Billy Checker")
 
 
