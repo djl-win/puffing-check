@@ -64,7 +64,7 @@ def _month_year(date_str: str):
 async def open_product(page) -> bool:
     """
     打开分类页面，找到“Belgrave to Lakeside Return”所属卡片里的 Buy Now 按钮并点击。
-    如果找不到就返回 False，由上层统一处理，不抛异常。
+    找不到就返回 False，不抛异常。
     """
     print("[提示] 打开分类页面:", CATEGORY_URL)
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
@@ -83,14 +83,22 @@ async def open_product(page) -> bool:
         except Exception:
             pass
 
-    # 1️⃣ 找到页面上所有包含 Buy Now 文本的 <a>
-    print("[提示] 尝试查找所有 'Buy Now' 按钮...")
-    buttons = page.locator("a", has_text=re.compile(r"buy\s*now", re.I))
+    # 🌟 关键改动：先等页面上真的出现 “Buy Now” 文本，再去找按钮
+    try:
+        print("[提示] 等待页面渲染出 'Buy Now' 文本...")
+        await page.wait_for_selector("text=Buy Now", timeout=15000)
+    except PWTimeout:
+        print("[错误] 15 秒内页面上没有出现 'Buy Now' 文本，可能是加载太慢或被风控。")
+        return False
+
+    # 1️⃣ 找到所有包含 Buy Now 文本的节点（通常就是 <a>）
+    print("[提示] 尝试查找所有 'Buy Now' 按钮节点...")
+    buttons = page.locator("text=Buy Now")
     count = await buttons.count()
-    print(f"[提示] 找到 Buy Now 按钮数量: {count}")
+    print(f"[提示] 找到 'Buy Now' 节点数量: {count}")
 
     if count == 0:
-        print("[错误] 页面上没有找到任何 'Buy Now' 按钮。")
+        print("[错误] 调用了 wait_for_selector 之后仍然找不到 'Buy Now'，放弃。")
         return False
 
     # 2️⃣ 遍历所有 Buy Now，找“祖先节点中包含 PRODUCT_NAME 文本”的那个
@@ -98,7 +106,6 @@ async def open_product(page) -> bool:
     for i in range(count):
         btn = buttons.nth(i)
         try:
-            # 这里不限定 div.card 之类的标签，只要祖先中有这段文字就算
             scope = btn.locator(
                 "xpath=ancestor::*[contains(., '{}')]".format(PRODUCT_NAME)
             )
@@ -121,7 +128,7 @@ async def open_product(page) -> bool:
             print("[提示] 通过 onclick(changeCategory...) 进入具体产品页面。")
             await page.evaluate(onclick_js)
         else:
-            print("[提示] 直接点击 Buy Now 按钮。")
+            print("[提示] 直接点击 Buy Now 按钮节点。")
             await target_btn.click(timeout=12000)
 
         try:
