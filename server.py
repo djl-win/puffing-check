@@ -1,18 +1,21 @@
 import re
+import os
 import asyncio
 import datetime as dt
 from typing import List, Tuple, Optional, Dict, Any
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ================= 配置 =================
 CATEGORY_URL = (
-    "https://bookings.puffingbillyrailway.org.au/BookingCat/Availability/?&ParentCategory=WEBEXCURSION"
+    "https://bookings.puffingbillyrailway.org.au/"
+    "BookingCat/Availability/?&ParentCategory=WEBEXCURSION"
 )
 PRODUCT_NAME = "Belgrave to Lakeside Return"
 HEADLESS = True  # 本地调试想看浏览器可以改成 False
+SCREENSHOT_PATH = "debug_loaded_page.png"
 # =======================================
 
 
@@ -59,21 +62,34 @@ def _month_year(date_str: str):
     return d.strftime("%B %Y"), d.day
 
 
+async def debug_snapshot(page, tag: str):
+    """保存当前页面截图，方便调试"""
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"{tag}_{ts}.png"
+    try:
+        await page.screenshot(path=fname, full_page=True)
+        print(f"[调试] 截图已保存: {fname}")
+    except Exception as e:
+        print(f"[调试] 保存截图失败: {e}")
+
+
 # ============ 打开产品页面 ============
 async def open_product(page) -> bool:
+    """
+    打开分类页面，找到“Belgrave to Lakeside Return”所属卡片里的 Buy Now 按钮并点击。
+    找不到就返回 False，不抛异常。
+    """
     print("[提示] 打开分类页面:", CATEGORY_URL)
-
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
 
-    # ⬇️⬇️⬇️ 这里：加载 URL 后立即截图，让你看到到底加载了什么页面
+    # 加载完成后立即截图（你可以通过 /debug/screenshot 查看）
     try:
-        await page.screenshot(path="debug_loaded_page.png", full_page=True)
-        print("[调试] 已保存加载后页面截图: debug_loaded_page.png")
+        await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+        print(f"[调试] 已保存加载后页面截图: {SCREENSHOT_PATH}")
     except Exception as e:
-        print("[调试] 无法截图: ", e)
-    # ⬆️⬆️⬆️
+        print("[调试] 无法截图:", e)
 
-    # 有些环境加载慢一点
+    # 稍等一下，给前端一点时间渲染
     await page.wait_for_timeout(2000)
 
     # 尝试关掉 cookie / 提示弹窗
@@ -84,18 +100,22 @@ async def open_product(page) -> bool:
                 await btn.first.click(timeout=1500)
                 print(f"[提示] 点击弹窗按钮: {label}")
                 break
-        except:
+        except Exception:
             pass
 
-    # 🌟 关键改动：先等页面上真的出现 “Buy Now” 文本，再去找按钮
+    # 再等一会儿，让产品列表渲染
+    await page.wait_for_timeout(2000)
+
+    # 🌟 尝试等待页面上出现 “Buy Now” 文本
     try:
         print("[提示] 等待页面渲染出 'Buy Now' 文本...")
         await page.wait_for_selector("text=Buy Now", timeout=15000)
     except PWTimeout:
         print("[错误] 15 秒内页面上没有出现 'Buy Now' 文本，可能是加载太慢或被风控。")
+        await debug_snapshot(page, "no_buy_now")
         return False
 
-    # 1️⃣ 找到所有包含 Buy Now 文本的节点（通常就是 <a>）
+    # 1️⃣ 找到所有包含 Buy Now 文本的节点
     print("[提示] 尝试查找所有 'Buy Now' 按钮节点...")
     buttons = page.locator("text=Buy Now")
     count = await buttons.count()
@@ -103,6 +123,7 @@ async def open_product(page) -> bool:
 
     if count == 0:
         print("[错误] 调用了 wait_for_selector 之后仍然找不到 'Buy Now'，放弃。")
+        await debug_snapshot(page, "no_buy_now_nodes")
         return False
 
     # 2️⃣ 遍历所有 Buy Now，找“祖先节点中包含 PRODUCT_NAME 文本”的那个
@@ -145,6 +166,7 @@ async def open_product(page) -> bool:
 
     except Exception as e:
         print(f"[错误] 点击 Buy Now 按钮失败: {e}")
+        await debug_snapshot(page, "click_buy_now_fail")
         return False
 
 
@@ -361,7 +383,10 @@ async def query_date(date_str: str) -> Dict[str, Any]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
         page = await browser.new_page()
 
@@ -520,6 +545,7 @@ async def index():
         <ul>
           <li>HTML 表格：<code>/run?date=15/12/2025</code></li>
           <li>JSON 数据：<code>/api?date=15/12/2025</code></li>
+          <li>调试截图：<code>/debug/screenshot</code></li>
         </ul>
       </body>
     </html>
@@ -539,9 +565,21 @@ async def run_json(date: str = Query(..., description="查询日期，格式 dd/
     return JSONResponse(content=result)
 
 
+@app.get("/debug/screenshot")
+async def debug_screenshot():
+    """
+    返回最近一次加载分类页面时保存的截图，用于调试 Railway 环境里页面长什么样
+    """
+    if not os.path.exists(SCREENSHOT_PATH):
+        return JSONResponse(
+            content={"error": "截图不存在，请先访问一次 /run 触发截图。"},
+            status_code=404,
+        )
+    return FileResponse(SCREENSHOT_PATH, media_type="image/png")
+
+
 # 本地直接运行：python server.py
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
-
-
