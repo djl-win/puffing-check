@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 # ================= 配置 =================
 CATEGORY_URL = (
     "https://bookings.puffingbillyrailway.org.au/"
-    "BookingCat/Availability/?ParentCategory=WEBEXCURSION"
+    "BookingCat/Availability/?&ParentCategory=WEBEXCURSION"
 )
 PRODUCT_NAME = "Belgrave to Lakeside Return"
 HEADLESS = True  # 本地调试想看浏览器可以改成 False
@@ -63,8 +63,8 @@ def _month_year(date_str: str):
 # ============ 打开产品页面 ============
 async def open_product(page) -> bool:
     """
-    打开分类页面，点击指定产品（PRODUCT_NAME）的 Buy Now。
-    找不到产品 / 结构变了时返回 False，而不是抛异常。
+    打开分类页面，找到“Belgrave to Lakeside Return”所属卡片里的 Buy Now 按钮并点击。
+    如果找不到就返回 False，由上层统一处理，不抛异常。
     """
     print("[提示] 打开分类页面:", CATEGORY_URL)
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
@@ -83,54 +83,46 @@ async def open_product(page) -> bool:
         except Exception:
             pass
 
-    # 先尝试通过 heading（h1/h2/h3）定位
-    card = None
-    try:
-        print(f"[提示] 尝试通过 heading 寻找产品: {PRODUCT_NAME}")
-        title = page.get_by_role("heading", name=PRODUCT_NAME)
-        await title.first.wait_for(state="visible", timeout=15000)
-        # 找到标题后，向上找包含它的 card 容器
-        card = title.first.locator(
-            "xpath=ancestor::div[contains(@class, 'card')]"
-        ).first
-    except PWTimeout:
-        print("[警告] get_by_role 找不到 heading，尝试备用选择器...")
-    except Exception as e:
-        print(f"[警告] 通过 heading 定位产品失败: {e}")
+    # 1️⃣ 找到页面上所有包含 Buy Now 文本的 <a>
+    print("[提示] 尝试查找所有 'Buy Now' 按钮...")
+    buttons = page.locator("a", has_text=re.compile(r"buy\s*now", re.I))
+    count = await buttons.count()
+    print(f"[提示] 找到 Buy Now 按钮数量: {count}")
 
-    # 备用：用 CSS :has(...) 选择器定位
-    if card is None:
+    if count == 0:
+        print("[错误] 页面上没有找到任何 'Buy Now' 按钮。")
+        return False
+
+    # 2️⃣ 遍历所有 Buy Now，找“祖先节点中包含 PRODUCT_NAME 文本”的那个
+    target_btn = None
+    for i in range(count):
+        btn = buttons.nth(i)
         try:
-            print("[提示] 使用 div.card:has(h2:has-text(...)) 尝试定位产品卡片")
-            card = page.locator(
-                f"div.card:has(h2:has-text('{PRODUCT_NAME}'))"
-            ).first
-            await card.wait_for(state="visible", timeout=10000)
-        except PWTimeout:
-            print("[错误] 备用 CSS 选择器也找不到产品卡片。")
-            return False
+            # 这里不限定 div.card 之类的标签，只要祖先中有这段文字就算
+            scope = btn.locator(
+                "xpath=ancestor::*[contains(., '{}')]".format(PRODUCT_NAME)
+            )
+            if await scope.count() > 0:
+                print(f"[提示] 第 {i} 个 Buy Now 上方找到了目标产品文本 '{PRODUCT_NAME}'。")
+                target_btn = btn
+                break
         except Exception as e:
-            print(f"[错误] 使用备用 CSS 选择器失败: {e}")
-            return False
+            print(f"[警告] 检查第 {i} 个 Buy Now 的祖先节点时出错: {e}")
 
-    # 现在 card 应该已经是对应产品卡片
+    # 3️⃣ 如果没匹配到特定产品，就退而求其次：用第一个 Buy Now
+    if target_btn is None:
+        print("[警告] 没有在任何 Buy Now 的祖先节点中找到目标产品名，退而求其次使用第一个 Buy Now。")
+        target_btn = buttons.first
+
+    # 4️⃣ 点击按钮（优先执行 onclick 里的 changeCategory(...)）
     try:
-        print("[提示] 已找到产品卡片，尝试在卡片内寻找 Buy Now 按钮...")
-        buy = card.locator("a:has-text('Buy Now')")
-        if await buy.count() == 0:
-            # 备用：如果文字不是完全一致，退而求其次拿第一个链接
-            print("[警告] 没有找到文字包含 'Buy Now' 的按钮，使用 card 内第一个 <a>。")
-            buy = card.locator("a").first
-        else:
-            buy = buy.first
-
-        onclick_js = await buy.get_attribute("onclick")
+        onclick_js = await target_btn.get_attribute("onclick")
         if onclick_js and "changeCategory" in onclick_js:
-            print("[提示] 通过 onclick(changeCategory) 进入具体日期页面。")
+            print("[提示] 通过 onclick(changeCategory...) 进入具体产品页面。")
             await page.evaluate(onclick_js)
         else:
             print("[提示] 直接点击 Buy Now 按钮。")
-            await buy.click(timeout=12000)
+            await target_btn.click(timeout=12000)
 
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
@@ -370,7 +362,7 @@ async def query_date(date_str: str) -> Dict[str, Any]:
                     "date": date_str,
                     "rows": [],
                     "available_count": 0,
-                    "message": "官网未找到指定产品卡片，可能页面结构已更新或被风控。"
+                    "message": f"官网未能定位到 '{PRODUCT_NAME}' 对应的 Buy Now 按钮，可能页面结构变更或被风控。"
                 }
 
             # 2. 选择日期
