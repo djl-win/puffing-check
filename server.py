@@ -1,6 +1,7 @@
 import re
+import asyncio
 import datetime as dt
-from typing import List, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -12,8 +13,9 @@ CATEGORY_URL = (
     "BookingCat/Availability/?ParentCategory=WEBEXCURSION"
 )
 PRODUCT_NAME = "Belgrave to Lakeside Return"
-HEADLESS = True  # Railway / Docker 上建议 True
+HEADLESS = True  # 本地调试想看浏览器可以改成 False
 # =======================================
+
 
 # ============ 状态匹配规则 ============
 PAT_LIMITED = re.compile(r"limited\s+seats\s+(\d+)\s+available", re.I)
@@ -23,7 +25,7 @@ PAT_NA = re.compile(r"\bnot\s+available\b", re.I)
 PAT_AVAIL = re.compile(r"\bavailable\b", re.I)
 
 
-def classify_status(text: str):
+def classify_status(text: str) -> Tuple[str, bool, Optional[int]]:
     """
     把单元格里的文本，归类为几种状态：
     返回: (code, is_available, seats_left)
@@ -59,13 +61,7 @@ def _month_year(date_str: str):
 
 
 # ============ 打开产品页面 ============
-async def open_product(page) -> bool:
-    """
-    打开 Puffing Billy 分类页，并进入目标产品详情。
-    返回:
-        True  - 成功打开产品
-        False - 没找到产品 / 结构变化 / 异常
-    """
+async def open_product(page):
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
 
     # 尝试关掉 cookie / 提示弹窗
@@ -76,22 +72,13 @@ async def open_product(page) -> bool:
         except Exception:
             pass
 
-    try:
-        # 找到包含产品名的卡片
-        card = page.locator(
-            f"article:has-text('{PRODUCT_NAME}'), "
-            f"div.card:has-text('{PRODUCT_NAME}')"
-        ).first
+    # 找到包含产品名的卡片
+    card = page.locator(
+        f"article:has-text('{PRODUCT_NAME}'), "
+        f"div.card:has-text('{PRODUCT_NAME}')"
+    ).first
+    await card.wait_for(state="visible", timeout=15000)
 
-        await card.wait_for(state="visible", timeout=25000)
-    except PWTimeout:
-        print(f"[错误] 在分类页中 25 秒内没有找到产品卡片：{PRODUCT_NAME}")
-        return False
-    except Exception as e:
-        print(f"[错误] 打开产品卡片时出现异常: {e}")
-        return False
-
-    # 找“Buy Now / Book Now”按钮
     buy = card.locator(
         "a:has-text('BUY NOW'), a:has-text('Buy Now'), a:has-text('Book Now')"
     )
@@ -99,21 +86,15 @@ async def open_product(page) -> bool:
         buy = card.locator("a").first
 
     onclick_js = await buy.first.get_attribute("onclick")
-    try:
-        if onclick_js and "changeCategory" in onclick_js:
-            await page.evaluate(onclick_js)  # 直接执行 changeCategory(...)
-        else:
-            await buy.first.click(timeout=12000)
-    except Exception as e:
-        print(f"[错误] 点击产品按钮失败: {e}")
-        return False
+    if onclick_js and "changeCategory" in onclick_js:
+        await page.evaluate(onclick_js)  # 直接执行 changeCategory(...)
+    else:
+        await buy.first.click(timeout=12000)
 
     try:
         await page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
         await page.wait_for_timeout(1000)
-
-    return True
 
 
 # ============ 用日历点选日期 ============
@@ -176,7 +157,7 @@ async def pick_date_via_calendar(page, date_str: str) -> bool:
 
         for i in range(cnt):
             txt = (await candidates.nth(i).inner_text()).strip()
-            if txt == str(day):
+            if txt == str(day):          # 必须完全相等，避免 1/11/21/31 混淆
                 matched = candidates.nth(i)
                 break
 
@@ -259,29 +240,26 @@ async def wait_for_table_refresh(page):
 
 
 # ============ 解析表格 ============
-async def read_name_and_status(table_root) -> List[Dict[str, Any]]:
+async def read_name_and_status(table_root):
     """
-    返回每一行的字典：
-    {
-      "name": 班次名称,
-      "status_text": 原始状态文本,
-      "code": 归类状态码,
-      "available": 是否可订,
-      "seats_left": 剩余座位（可能为 None）
-    }
+    解析 AvailabilityTable，返回：
+      List[(name, text, code, ok, seats)]
     """
+
+    # 先锁定 table 容器
     table = table_root.locator(".cl_availability-table").first
     if await table.count() == 0:
         print("[警告] 没有找到 .cl_availability-table 容器")
         return []
 
+    # 一行一个 wrap
     wraps = table.locator(".cl_availability-table__wrap")
     wcnt = await wraps.count()
     if wcnt == 0:
         print("[警告] 没有找到任何 .cl_availability-table__wrap 行")
         return []
 
-    result: List[Dict[str, Any]] = []
+    result = []
 
     for i in range(wcnt):
         wrap = wraps.nth(i)
@@ -289,6 +267,7 @@ async def read_name_and_status(table_root) -> List[Dict[str, Any]]:
         # 班次名称
         title = wrap.locator(".cl_availability-product__title span").first
         if await title.count() == 0:
+            # 有可能是空行 / 分割行，跳过
             continue
         name = (await title.inner_text()).strip()
 
@@ -318,213 +297,186 @@ async def read_name_and_status(table_root) -> List[Dict[str, Any]]:
                 text = aria.strip()
 
         code, ok, seats = classify_status(text)
-        result.append(
-            {
-                "name": name,
-                "status_text": text or "Not Available",
-                "code": code,
-                "available": ok,
-                "seats_left": seats,
-            }
-        )
+        result.append((name, text or "Not Available", code, ok, seats))
 
     return result
 
 
-# ============ 主查询逻辑 ============
+# ============ 核心查询函数（给 API 用） ============
 async def query_date(date_str: str) -> Dict[str, Any]:
     """
-    返回统一结构：
-    {
-        "ok": bool,
-        "message": str,
-        "date": "15/12/2025",
-        "rows": [ {...}, ... ]
-    }
+    给指定日期跑一遍官网，返回结构化结果
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
         page = await browser.new_page()
 
         try:
-            # 1. 进入产品
-            ok = await open_product(page)
-            if not ok:
-                return {
-                    "ok": False,
-                    "message": f"官网页面上找不到产品『{PRODUCT_NAME}』，可能结构已改变或被重定向。",
-                    "date": date_str,
-                    "rows": [],
-                }
-
-            # 2. 日历中点击目标日期
+            await open_product(page)
             picked = await pick_date_via_calendar(page, date_str)
             if not picked:
                 return {
-                    "ok": False,
-                    "message": f"官网没有 {date_str} 可售班次（日期不可选或超出范围）。",
                     "date": date_str,
                     "rows": [],
+                    "available_count": 0,
+                    "message": "官网无此日期可选或为灰色，不可预订"
                 }
 
-            # 3. 等待表格刷新
             await wait_for_table_refresh(page)
-
-            # 4. 读取表格
             table_root = page.locator("#AvailabilityTable").first
             await table_root.wait_for(state="visible", timeout=15000)
 
-            rows = await read_name_and_status(table_root)
-            if not rows:
-                return {
-                    "ok": False,
-                    "message": f"官网没有 {date_str} 的班次列表，视为没票卖。",
-                    "date": date_str,
-                    "rows": [],
-                }
+            rows_raw = await read_name_and_status(table_root)
+
+            rows: List[Dict[str, Any]] = []
+            available_count = 0
+            for name, text, code, ok, seats in rows_raw:
+                if ok:
+                    available_count += 1
+                rows.append({
+                    "name": name,
+                    "status": text,
+                    "code": code,
+                    "available": ok,
+                    "seats": seats
+                })
 
             return {
-                "ok": True,
-                "message": "success",
                 "date": date_str,
                 "rows": rows,
+                "available_count": available_count,
+                "message": "OK" if rows else "该日期无班次列表"
             }
 
         finally:
             await browser.close()
 
 
-# ================= FastAPI 部分 =================
+# ============ HTML 渲染 ============
 
-app = FastAPI(title="Puffing Billy Ticket Checker")
+def build_html(result: Dict[str, Any]) -> str:
+    date_str = result["date"]
+    rows = result["rows"]
+    available_count = result["available_count"]
+    message = result["message"]
+
+    # 统计
+    total = len(rows)
+
+    # 简单 CSS + emoji 表格
+    html_parts = [
+        "<!doctype html>",
+        "<html lang='zh-CN'>",
+        "<head>",
+        "<meta charset='utf-8' />",
+        f"<title>🚂 Puffing Billy 余票查询 - {date_str}</title>",
+        "<style>",
+        "body { font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 16px; background: #f5f5f5; }",
+        "h1 { font-size: 20px; margin-bottom: 8px; }",
+        ".summary { margin-bottom: 12px; }",
+        "table { border-collapse: collapse; width: 100%; background: #fff; }",
+        "th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }",
+        "th { background: #fafafa; text-align: left; }",
+        "tr:nth-child(even) { background: #f9f9f9; }",
+        ".ok { color: #0a960a; font-weight: bold; }",
+        ".no { color: #c00; font-weight: bold; }",
+        ".code { color: #999; font-size: 12px; }",
+        "</style>",
+        "</head>",
+        "<body>",
+        f"<h1>🚂 Puffing Billy 余票查询</h1>",
+        f"<div class='summary'>📅 日期：<b>{date_str}</b><br>",
+        f"🧾 班次总数：<b>{total}</b>，✅ 可订：<b>{available_count}</b><br>",
+        f"ℹ️ 状态：{message}</div>",
+    ]
+
+    if not rows:
+        html_parts.append("<p>😢 该日期没有可显示的班次。</p>")
+    else:
+        html_parts.append("<table>")
+        html_parts.append(
+            "<tr>"
+            "<th>时间 / 班次</th>"
+            "<th>状态</th>"
+            "<th>是否可订</th>"
+            "<th>余位</th>"
+            "</tr>"
+        )
+
+        for row in rows:
+            name = row["name"]
+            status = row["status"]
+            available = row["available"]
+            seats = row["seats"]
+
+            if available:
+                emoji = "✅"
+                cls = "ok"
+                avail_text = "可订"
+            else:
+                emoji = "❌"
+                cls = "no"
+                avail_text = "不可订"
+
+            if seats is not None:
+                seat_text = f"🎟️ {seats} 位"
+            else:
+                seat_text = "—"
+
+            html_parts.append(
+                "<tr>"
+                f"<td>{name}</td>"
+                f"<td>{status}</td>"
+                f"<td class='{cls}'>{emoji} {avail_text}</td>"
+                f"<td>{seat_text}</td>"
+                "</tr>"
+            )
+
+        html_parts.append("</table>")
+
+    html_parts.append("<p style='margin-top:12px;font-size:12px;color:#999;'>"
+                      "数据来源：Puffing Billy Railway 官网实时查询，仅供参考。</p>")
+    html_parts.append("</body></html>")
+
+    return "\n".join(html_parts)
+
+
+# ============ FastAPI 应用 ============
+
+app = FastAPI(title="Puffing Billy Checker")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html = """
+    return """
     <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Puffing Billy 余票查询 API</title>
-      </head>
-      <body>
+      <head><meta charset="utf-8"><title>🚂 Puffing Billy 余票查询</title></head>
+      <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;">
         <h1>🚂 Puffing Billy 余票查询 API</h1>
         <p>示例：</p>
         <ul>
           <li>HTML 表格：<code>/run?date=15/12/2025</code></li>
           <li>JSON 数据：<code>/api?date=15/12/2025</code></li>
         </ul>
-        <p>日期格式：<b>dd/MM/yyyy</b>（例如：15/12/2025）。</p>
       </body>
     </html>
     """
+
+
+@app.get("/run", response_class=HTMLResponse)
+async def run_html(date: str = Query(..., description="查询日期，格式 dd/MM/YYYY，例如 15/12/2025")):
+    result = await query_date(date)
+    html = build_html(result)
     return HTMLResponse(content=html)
 
 
 @app.get("/api", response_class=JSONResponse)
-async def run_api(date: str = Query(..., description="日期，格式 dd/MM/yyyy")):
-    """
-    返回 JSON 结构：
-    {
-      ok: bool,
-      message: str,
-      date: str,
-      rows: [
-        {
-          name, status_text, code, available, seats_left
-        }, ...
-      ]
-    }
-    """
+async def run_json(date: str = Query(..., description="查询日期，格式 dd/MM/YYYY，例如 15/12/2025")):
     result = await query_date(date)
     return JSONResponse(content=result)
 
 
-@app.get("/run", response_class=HTMLResponse)
-async def run_html(date: str = Query(..., description="日期，格式 dd/MM/yyyy")):
-    """
-    返回 HTML 表格版本。
-    """
-    result = await query_date(date)
-
-    if not result["ok"]:
-        # 业务失败，简单提示一下
-        html = f"""
-        <html>
-          <head>
-            <meta charset="utf-8" />
-            <title>Puffing Billy 余票查询</title>
-          </head>
-          <body>
-            <h1>🚂 Puffing Billy 余票查询</h1>
-            <p><b>日期：</b>{result['date']}</p>
-            <p>❌ {result['message']}</p>
-          </body>
-        </html>
-        """
-        return HTMLResponse(content=html, status_code=200)
-
-    rows = result["rows"]
-
-    # 统计可订数量
-    available_count = sum(1 for r in rows if r["available"])
-
-    # 生成表格
-    table_rows_html = ""
-    for r in rows:
-        tag = "✅ 可订" if r["available"] else "❌ 不可订"
-        extra = f"（余位 {r['seats_left']}）" if r["seats_left"] is not None else ""
-        table_rows_html += f"""
-        <tr>
-          <td>{r['name']}</td>
-          <td>{r['status_text']}</td>
-          <td>{tag} {extra}</td>
-          <td>{r['code']}</td>
-        </tr>
-        """
-
-    html = f"""
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Puffing Billy 余票查询</title>
-        <style>
-          body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            padding: 20px;
-          }}
-          table {{
-            border-collapse: collapse;
-            min-width: 600px;
-          }}
-          th, td {{
-            border: 1px solid #ccc;
-            padding: 6px 10px;
-            text-align: left;
-          }}
-          th {{
-            background: #f5f5f5;
-          }}
-        </style>
-      </head>
-      <body>
-        <h1>🚂 Puffing Billy 余票查询</h1>
-        <p><b>日期：</b>{result['date']}</p>
-        <p>🟢 可订班次数量：<b>{available_count}</b></p>
-        <table>
-          <thead>
-            <tr>
-              <th>班次名称</th>
-              <th>官网状态</th>
-              <th>是否可订</th>
-              <th>状态码</th>
-            </tr>
-          </thead>
-          <tbody>
-            {table_rows_html}
-          </tbody>
-        </table>
-      </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
+# 本地直接运行：python server.py
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
