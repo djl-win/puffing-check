@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.56.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 WORKDIR /app
 
@@ -10,3 +10,4 @@ RUN pip install -r requirements.txt
 EXPOSE 8000
 
 CMD ["python", "server.py"]
+
