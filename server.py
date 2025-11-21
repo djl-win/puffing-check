@@ -61,14 +61,19 @@ def _month_year(date_str: str):
 
 # ============ 打开产品页面 ============
 async def open_product(page) -> bool:
-    """
-    打开分类页面，找到“Belgrave to Lakeside Return”所属卡片里的 Buy Now 按钮并点击。
-    找不到就返回 False，不抛异常。
-    """
     print("[提示] 打开分类页面:", CATEGORY_URL)
+
     await page.goto(CATEGORY_URL, wait_until="domcontentloaded")
 
-    # 有些环境加载慢一点，稍微等一下
+    # ⬇️⬇️⬇️ 这里：加载 URL 后立即截图，让你看到到底加载了什么页面
+    try:
+        await page.screenshot(path="debug_loaded_page.png", full_page=True)
+        print("[调试] 已保存加载后页面截图: debug_loaded_page.png")
+    except Exception as e:
+        print("[调试] 无法截图: ", e)
+    # ⬆️⬆️⬆️
+
+    # 有些环境加载慢一点
     await page.wait_for_timeout(2000)
 
     # 尝试关掉 cookie / 提示弹窗
@@ -79,7 +84,7 @@ async def open_product(page) -> bool:
                 await btn.first.click(timeout=1500)
                 print(f"[提示] 点击弹窗按钮: {label}")
                 break
-        except Exception:
+        except:
             pass
 
     # 🌟 关键改动：先等页面上真的出现 “Buy Now” 文本，再去找按钮
@@ -538,4 +543,5 @@ async def run_json(date: str = Query(..., description="查询日期，格式 dd/
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+
 
